@@ -1,6 +1,6 @@
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
-yt-dlp>=2023.11.16
+yt-dlp
 sqlalchemy[asyncio]>=2.0.25
 aiosqlite>=0.19.0
 pydantic>=2.5.0
