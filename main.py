@@ -1,23 +1,24 @@
 import uuid
 import logging
+import uvicorn
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
-# استيراد الوحدات الخاصة بنا
+# استيراد ملفات المشروع الداخلية
 from config import get_settings
 from database import init_db, get_db, RequestLog
 from services import YtDlpService
-from pydantic import BaseModel, HttpUrl, field_validator
+from pydantic import BaseModel, field_validator
 
-# إعداد الـ Logging
+# إعداد السجلات (Logging)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api")
 settings = get_settings()
 
-# --- Pydantic Schemas ---
+# --- نماذج البيانات (Pydantic Schemas) ---
 class VideoRequest(BaseModel):
     url: str
     format_type: str = "video"
@@ -35,21 +36,27 @@ class VideoResponse(BaseModel):
     data: dict | None = None
     error: str | None = None
 
-# --- Lifespan (Startup/Shutdown) ---
+# --- إدارة دورة حياة التطبيق (Lifespan) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # تهيئة قاعدة البيانات عند البدء
+    # 1. كود يعمل عند تشغيل السيرفر
+    logger.info("Initializing Database...")
     await init_db()
+    logger.info(f"Server started on port {settings.PORT}")
+    
     yield
-    # تنظيف الموارد عند الإغلاق (إن وجد)
+    
+    # 2. كود يعمل عند إغلاق السيرفر (تنظيف)
+    logger.info("Server shutting down...")
 
-# --- App Init ---
+# --- إعداد التطبيق ---
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.VERSION,
     lifespan=lifespan
 )
 
+# تفعيل CORS للسماح بالطلبات من أي مكان
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -57,9 +64,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Helper Functions ---
+# --- الوظائف المساعدة ---
 async def save_log(db: AsyncSession, req_id: str, payload: VideoRequest, result: dict, request: Request):
-    """حفظ السجل في قاعدة البيانات بشكل منفصل"""
+    """حفظ السجل في قاعدة البيانات كخلفية (Background Task)"""
     try:
         log_entry = RequestLog(
             id=req_id,
@@ -72,7 +79,7 @@ async def save_log(db: AsyncSession, req_id: str, payload: VideoRequest, result:
             filesize=result.get("filesize"),
             download_url=result.get("url"),
             error_msg=result.get("error"),
-            client_ip=request.client.host,
+            client_ip=request.client.host if request.client else "unknown",
             user_agent=request.headers.get("user-agent")
         )
         db.add(log_entry)
@@ -80,7 +87,25 @@ async def save_log(db: AsyncSession, req_id: str, payload: VideoRequest, result:
     except Exception as e:
         logger.error(f"Failed to save log: {e}")
 
-# --- Endpoints ---
+# --- نقاط النهاية (Endpoints) ---
+
+@app.api_route("/ping", methods=["GET", "HEAD"])
+async def ping(request: Request):
+    """
+    نقطة فحص الاتصال:
+    - HEAD: يرجع 200 فقط (لفحص العمل).
+    - GET: يرجع تفاصيل الحالة.
+    """
+    if request.method == "HEAD":
+        # استجابة سريعة لأدوات المراقبة
+        return Response(status_code=200)
+    
+    return {
+        "status": "online",
+        "service": settings.APP_NAME,
+        "version": settings.VERSION,
+        "mode": "debug" if settings.DEBUG else "production"
+    }
 
 @app.post("/api/v1/extract", response_model=VideoResponse)
 async def extract_video(
@@ -89,27 +114,23 @@ async def extract_video(
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    نقطة النهاية الرئيسية لاستخراج روابط الفيديو.
-    """
+    """استخراج رابط الفيديو وتشغيله في الخلفية"""
     request_id = str(uuid.uuid4())
     
-    # 1. استدعاء الخدمة (العملية الثقيلة)
-    # ملاحظة: يتم تشغيلها في ThreadPool داخل Service لعدم تعطيل السيرفر
+    # معالجة الرابط (Logic)
     result = await YtDlpService.process_url(
         payload.url, 
         payload.format_type, 
         payload.quality
     )
     
-    # 2. تسجيل العملية في الخلفية (Fire and Forget)
-    # نمرر دالة wrapper لأن background_tasks تحتاج دالة عادية أو async
+    # دالة لحفظ السجل وتمرير الـ Session بشكل آمن
     async def log_wrapper():
-        # نحتاج session جديدة للمهمة الخلفية لأن الـ session الحالية ستغلق بعد الرد
         async for session in get_db():
             await save_log(session, request_id, payload, result, request)
             break
             
+    # إضافة المهمة للخلفية (Fire and Forget)
     background_tasks.add_task(log_wrapper)
 
     if result["status"] == "error":
@@ -127,10 +148,15 @@ async def extract_video(
 
 @app.get("/api/v1/stats")
 async def get_stats(db: AsyncSession = Depends(get_db)):
-    """إحصائيات بسيطة"""
+    """جلب إحصائيات الاستخدام"""
     try:
-        total = await db.scalar(select(func.count(RequestLog.id)))
-        success = await db.scalar(select(func.count(RequestLog.id)).where(RequestLog.status == 'success'))
+        # حساب العدد الكلي
+        total_query = select(func.count(RequestLog.id))
+        total = await db.scalar(total_query) or 0
+        
+        # حساب عدد الطلبات الناجحة
+        success_query = select(func.count(RequestLog.id)).where(RequestLog.status == 'success')
+        success = await db.scalar(success_query) or 0
         
         return {
             "total_requests": total,
@@ -138,14 +164,19 @@ async def get_stats(db: AsyncSession = Depends(get_db)):
             "successful_requests": success
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Stats error: {e}")
+        # إرجاع قيم صفرية بدلاً من الخطأ في حالة عدم جاهزية الـ DB
+        return {"total_requests": 0, "success_rate": "0%", "note": "Database stats unavailable"}
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": settings.VERSION}
+    """فحص صحة السيرفر (Health Check) لـ Render"""
+    return {"status": "healthy"}
 
+# --- نقطة التشغيل الرئيسية ---
 if __name__ == "__main__":
-    import uvicorn
+    # هذا الجزء مهم جداً لـ Render
+    # يقوم بقراءة البورت من الإعدادات (التي تقرؤه من متغيرات البيئة)
     uvicorn.run(
         "main:app", 
         host=settings.HOST, 
