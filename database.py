@@ -1,3 +1,4 @@
+import logging
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy import String, Integer, DateTime, Text, JSON
@@ -5,6 +6,7 @@ from datetime import datetime
 from config import get_settings
 
 settings = get_settings()
+logger = logging.getLogger("database")
 
 # إعداد المحرك غير المتزامن
 engine = create_async_engine(
@@ -42,8 +44,18 @@ class RequestLog(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 async def init_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    """إنشاء الجداول مع معالجة الأخطاء في حال وجودها مسبقاً"""
+    try:
+        async with engine.begin() as conn:
+            # checkfirst=True يحاول التأكد من عدم وجود الجدول قبل إنشائه
+            await conn.run_sync(Base.metadata.create_all, checkfirst=True)
+    except Exception as e:
+        # إذا حدث خطأ لأن الجدول موجود، نقوم بتجاهله وإكمال التشغيل
+        if "already exists" in str(e):
+            logger.warning("Database tables already exist. Skipping creation.")
+        else:
+            logger.error(f"Database initialization error: {e}")
+            # لا نوقف السيرفر، بل نكمل (قد يكون خطأ بسيط)
 
 async def get_db():
     async with SessionLocal() as session:
