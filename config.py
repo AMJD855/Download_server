@@ -4,17 +4,20 @@ import os
 
 class Settings(BaseSettings):
     APP_NAME: str = "Video Download API"
-    VERSION: str = "2.0.0"
+    VERSION: str = "2.1.0"
     DEBUG: bool = False
     
     # Server Config
+    # Render يعطي المنفذ عبر متغير بيئة، لذلك يجب قراءته
     HOST: str = "0.0.0.0"
-    PORT: int = 8000
+    PORT: int = int(os.getenv("PORT", 8000))
     
     # Database
-    DATABASE_URL: str = "sqlite+aiosqlite:///./production.db"
+    # استخدام مسار مطلق لضمان العمل بشكل صحيح
+    # إذا كنت تستخدم Render Disk، غير المسار إلى /var/data/production.db
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///production.db")
     
-    # Worker Config (للتحكم في عدد العمليات المتزامنة لـ yt-dlp)
+    # Worker Config
     MAX_WORKERS: int = 4
     
     class Config:
